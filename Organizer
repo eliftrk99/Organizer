@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+Akilli Dosya Duzenleyici (Smart File Organizer)
+=================================================
+
+Belirtilen bir klasoru (orn. Indirilenler, Masaustu) tarar, dosya
+uzantilarina gore kategorize eder ve ilgili alt klasorlere tasir.
+
+Kullanim:
+    # Tek seferlik tarama ve duzenleme
+    python organizer.py --path "/Users/kullanici/Downloads"
+
+    # Ne olacagini gormek icin (dosyalari tasimadan)
+    python organizer.py --path "/Users/kullanici/Downloads" --dry-run
+
+    # Klasoru surekli izleyip yeni dosyalari aninda duzenleme
+    # (pip install watchdog gerektirir)
+    python organizer.py --path "/Users/kullanici/Downloads" --watch
+
+Ozellikler:
+    - Uzanti -> kategori esleme (JSON ile ozellestirilebilir)
+    - Isim cakismalarinda otomatik yeniden adlandirma (dosya(1).pdf)
+    - Dry-run modu: gercekten tasimadan sonucu onizleme
+    - Watchdog ile canli izleme (opsiyonel)
+    - Islem gunlugu (organizer.log)
+"""
+
+import argparse
+import json
+import logging
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+# ----------------------------------------------------------------------
+# 1. Varsayilan Kurallar: Uzanti -> Hedef Klasor
+# ----------------------------------------------------------------------
+DEFAULT_RULES = {
+    "Belgeler": [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".xls",
+                 ".pptx", ".ppt", ".csv", ".odt", ".md"],
+    "Resimler": [".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
+                 ".bmp", ".tiff", ".heic"],
+    "Arsivler": [".zip", ".rar", ".7z", ".tar", ".gz", ".iso"],
+    "Muzik": [".mp3", ".wav", ".flac", ".aac", ".m4a"],
+    "Videolar": [".mp4", ".mov", ".avi", ".mkv", ".webm"],
+    "Programlar": [".exe", ".msi", ".dmg", ".pkg", ".deb", ".apk"],
+    "Kod": [".py", ".js", ".html", ".css", ".json", ".java", ".cpp",
+            ".c", ".ipynb", ".sh"],
+}
+
+
+def build_extension_map(rules: dict) -> dict:
+    """{'.pdf': 'Belgeler', '.jpg': 'Resimler', ...} seklinde ters harita kurar."""
+    ext_map = {}
+    for folder, extensions in rules.items():
+        for ext in extensions:
+            ext_map[ext.lower()] = folder
+    return ext_map
+
+
+def setup_logging(target_dir: Path) -> None:
+    log_path = target_dir / "organizer.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
+def unique_destination(dest_folder: Path, filename: str) -> Path:
+    """Ayni isimde dosya varsa 'ad(1).uzanti' seklinde benzersiz yol uretir."""
+    dest = dest_folder / filename
+    if not dest.exists():
+        return dest
+
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    counter = 1
+    while True:
+        candidate = dest_folder / f"{stem}({counter}){suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def organize_file(file_path: Path, target_dir: Path, ext_map: dict,
+                   other_folder: str, dry_run: bool) -> None:
+    """Tek bir dosyayi uygun kategoriye tasir."""
+    ext = file_path.suffix.lower()
+    category = ext_map.get(ext, other_folder)
+    dest_folder = target_dir / category
+    dest_path = unique_destination(dest_folder, file_path.name)
+
+    if dry_run:
+        logging.info("[DRY-RUN] %s -> %s/", file_path.name, category)
+        return
+
+    dest_folder.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(file_path), str(dest_path))
+    logging.info("Tasindi: %s -> %s/%s", file_path.name, category, dest_path.name)
+
+
+def organize_directory(target_dir: Path, ext_map: dict, other_folder: str,
+                        dry_run: bool, known_folders: set) -> int:
+    """Klasordeki tum dosyalari tek seferde tarar ve duzenler. Tasinan dosya sayisini dondurur."""
+    count = 0
+    for entry in sorted(target_dir.iterdir()):
+        if entry.is_dir():
+            continue
+        if entry.name in ("organizer.log",):
+            continue
+        organize_file(entry, target_dir, ext_map, other_folder, dry_run)
+        count += 1
+    return count
+
+
+# ----------------------------------------------------------------------
+# 2. Canli Izleme (watchdog) - opsiyonel
+# ----------------------------------------------------------------------
+def watch_directory(target_dir: Path, ext_map: dict, other_folder: str, dry_run: bool):
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+    except ImportError:
+        logging.error(
+            "watchdog kutuphanesi bulunamadi. Kurmak icin: pip install watchdog"
+        )
+        sys.exit(1)
+
+    class Handler(FileSystemEventHandler):
+        def on_created(self, event):
+            if event.is_directory:
+                return
+            # Dosyanin tam olarak yazilmasini beklemek icin kisa bir gecikme
+            time.sleep(1)
+            file_path = Path(event.src_path)
+            if file_path.exists():
+                organize_file(file_path, target_dir, ext_map, other_folder, dry_run)
+
+    handler = Handler()
+    observer = Observer()
+    observer.schedule(handler, str(target_dir), recursive=False)
+    observer.start()
+    logging.info("Canli izleme basladi: %s (durdurmak icin Ctrl+C)", target_dir)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+        logging.info("Izleme durduruldu.")
+    observer.join()
+
+
+# ----------------------------------------------------------------------
+# 3. Ana Program
+# ----------------------------------------------------------------------
+def load_rules(rules_path: str | None) -> dict:
+    if not rules_path:
+        return DEFAULT_RULES
+    with open(rules_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Akilli Dosya Duzenleyici")
+    parser.add_argument("--path", required=True, help="Duzenlenecek klasorun yolu")
+    parser.add_argument("--rules", default=None,
+                         help="Ozel kurallar icin JSON dosyasi (opsiyonel)")
+    parser.add_argument("--other-folder", default="Diger",
+                         help="Eslesmeyen uzantilar icin klasor adi (varsayilan: Diger)")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="Dosyalari tasimadan sadece sonucu goster")
+    parser.add_argument("--watch", action="store_true",
+                         help="Klasoru surekli izle ve yeni dosyalari aninda duzenle")
+    args = parser.parse_args()
+
+    target_dir = Path(args.path).expanduser().resolve()
+    if not target_dir.is_dir():
+        print(f"Hata: '{target_dir}' bir klasor degil ya da mevcut degil.")
+        sys.exit(1)
+
+    setup_logging(target_dir)
+    rules = load_rules(args.rules)
+    ext_map = build_extension_map(rules)
+    known_folders = set(rules.keys()) | {args.other_folder}
+
+    logging.info("Hedef klasor: %s", target_dir)
+    if args.dry_run:
+        logging.info("DRY-RUN modu aktif: dosyalar gercekten tasinmayacak.")
+
+    if args.watch:
+        # Once mevcut dosyalari bir kez duzenle, sonra izlemeye basla
+        organize_directory(target_dir, ext_map, args.other_folder, args.dry_run, known_folders)
+        watch_directory(target_dir, ext_map, args.other_folder, args.dry_run)
+    else:
+        moved = organize_directory(target_dir, ext_map, args.other_folder, args.dry_run, known_folders)
+        logging.info("Tamamlandi. Islenen dosya sayisi: %d", moved)
+
+
+if __name__ == "__main__":
+    main()
